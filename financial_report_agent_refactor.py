@@ -61,7 +61,14 @@ newsapi = NewsApiClient(api_key=NEWSAPI_KEY) if NEWSAPI_KEY else None
 # Instantiate LLM client if available
 llm = None
 if ChatGoogleGenerativeAI is not None and os.environ.get("GOOGLE_API_KEY"):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.0", temperature=0.0, max_retries=2)
+    # Allow model selection via environment variable so users can pick a supported model
+    # Default to a more recent/available Gemini variant that is commonly supported
+    MODEL_NAME = os.environ.get("GOOGLE_MODEL", "gemini-2.5-flash")
+    try:
+        llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0.0, max_retries=2)
+    except Exception:
+        # If instantiation fails (e.g., unsupported model name), disable LLM usage
+        llm = None
 
 
 # -----------------------------

@@ -13,7 +13,7 @@ This project generates automated financial reports for any stock ticker using Py
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/your-username/financial_report.git
+git clone https://github.com/Evangeliab/financial-report-agent.git
 cd financial_report
 ```
 
