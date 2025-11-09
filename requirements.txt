@@ -3,3 +3,5 @@ matplotlib
 newsapi-python
 langchain-google-genai
 langgraph
+
+python-dotenv

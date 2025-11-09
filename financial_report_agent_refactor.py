@@ -18,22 +18,46 @@ import base64
 import datetime
 import math
 import textwrap
+import logging
 
 import yfinance as yf
 import matplotlib.pyplot as plt
 from newsapi import NewsApiClient
 
+# Simple dotenv loader (no external dependency) — loads .env from project root if present.
+from pathlib import Path
+
+# Require python-dotenv for .env handling (simpler, predictable behavior).
+from dotenv import load_dotenv
+
+# Load .env from the project root so subsequent code sees configured keys.
+root = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=str(root / ".env"), override=False)
+
+
+def get_model_name() -> str:
+    """Return the configured Google model name from environment (or default).
+
+    Use this helper when you want the value to be read at call time (tests,
+    dynamic reconfiguration). For backwards compatibility we still expose
+    a module-level alias `MODEL_NAME` (evaluated once at import).
+    """
+    return os.environ.get("GOOGLE_MODEL", "gemini-2.5-flash")
+
+
+# Backwards-compatible alias (evaluated once). Prefer `get_model_name()` for
+# runtime flexibility (e.g., tests that patch env vars after import).
+MODEL_NAME = get_model_name()
+
+# Logger for warnings/errors (ensure available before we try to instantiate LLM)
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig()
+
 # Optional imports for LLM and StateGraph
+from langgraph.graph import StateGraph
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-try:
-    from langchain_google_genai import ChatGoogleGenerativeAI
-except Exception:
-    ChatGoogleGenerativeAI = None
-
-try:
-    from langgraph.graph import StateGraph
-except Exception:
-    StateGraph = None
 
 
 # -----------------------------
@@ -61,15 +85,24 @@ newsapi = NewsApiClient(api_key=NEWSAPI_KEY) if NEWSAPI_KEY else None
 # Instantiate LLM client if available
 llm = None
 if ChatGoogleGenerativeAI is not None and os.environ.get("GOOGLE_API_KEY"):
-    # Allow model selection via environment variable so users can pick a supported model
-    # Default to a more recent/available Gemini variant that is commonly supported
-    MODEL_NAME = os.environ.get("GOOGLE_MODEL", "gemini-2.5-flash")
     try:
-        llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0.0, max_retries=2)
-    except Exception:
-        # If instantiation fails (e.g., unsupported model name), disable LLM usage
+        # Resolve model name at instantiation time (uses get_model_name()).
+        model_name = get_model_name()
+        llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.0, max_retries=2)
+        logger.info("Instantiated LLM client with model=%s", model_name)
+    except Exception as e:
+        # If instantiation fails (e.g., unsupported model name), disable LLM usage but log the error
+        # Use the same resolution for the log message so it matches what we attempted.
+        try:
+            attempted = model_name
+        except NameError:
+            attempted = get_model_name()
+        logger.warning("Failed to instantiate LLM client for model=%s: %s", attempted, repr(e))
         llm = None
 
+if llm is None:
+    print("WARNING: LLM features are disabled. To enable, set GOOGLE_API_KEY and install langchain_google_genai.")
+    print("Some features (news sentiment, analyst commentary) will use fallback logic.")
 
 # -----------------------------
 # Types
@@ -190,29 +223,36 @@ def valuation_agent(state: FinancialReportState) -> Dict[str, Any]:
 # News Agent (LLM-based sentiment scoring)
 # -----------------------------
 
-def _llm_score_article(article_title: str, article_description: str) -> Dict[str, Any]:
+def _llm_score_article(article_title: str, article_description: str, use_llm: bool = True) -> Dict[str, Any]:
     """Use the LLM to score sentiment and extract a short rationale.
 
     If no LLM is available, fall back to keyword heuristics.
     """
-    if llm is None:
-        # fallback simple heuristic
-        desc = (article_description or "").lower()
-        positive_keywords = ["beat", "growth", "strong", "positive", "surge", "upgrade", "outperform"]
-        negative_keywords = ["miss", "downgrade", "lawsuit", "loss", "recall", "weak", "slow"]
-        score = 0
-        for w in positive_keywords:
-            if w in desc:
-                score += 1
-        for w in negative_keywords:
-            if w in desc:
-                score -= 1
-        label = "Neutral"
-        if score > 0:
-            label = "Positive"
-        elif score < 0:
-            label = "Negative"
-        return {"label": label, "score": score, "rationale": "Keyword heuristic"}
+    # def _heuristic(desc_text: str) -> Dict[str, Any]:
+    #     d = (desc_text or "").lower()
+    #     positive_keywords = ["beat", "growth", "strong", "positive", "surge", "upgrade", "outperform"]
+    #     negative_keywords = ["miss", "downgrade", "lawsuit", "loss", "recall", "weak", "slow"]
+    #     score = 0
+    #     for w in positive_keywords:
+    #         if w in d:
+    #             score += 1
+    #     for w in negative_keywords:
+    #         if w in d:
+    #             score -= 1
+    #     label = "Neutral"
+    #     if score > 0:
+    #         label = "Positive"
+    #     elif score < 0:
+    #         label = "Negative"
+    #     return {"label": label, "score": score, "rationale": "Keyword heuristic"}
+
+    # # use_llm semantics (now strict boolean):
+    # # - use_llm == True: require LLM; raise if unavailable
+    # # - use_llm == False: always use heuristic
+    # if not use_llm:
+    #     return _heuristic(article_description)
+    # if llm is None:
+    #     raise RuntimeError("LLM scoring requested (use_llm=True) but no LLM client is available. Set GOOGLE_API_KEY and install the required SDK.")
 
     # If LLM is available, ask for a sentiment label and a 1-2 sentence rationale.
     prompt = textwrap.dedent(f"""
@@ -228,6 +268,9 @@ def _llm_score_article(article_title: str, article_description: str) -> Dict[str
     Return ONLY JSON.
     """)
 
+    # LLM is required (we raised above if missing). If the LLM invocation fails, propagate
+    # the exception so the caller sees quota/auth/network errors rather than silently
+    # falling back to heuristics.
     response = llm.invoke(prompt)
     # The response format depends on the LLM client; best-effort parsing
     text = getattr(response, "content", str(response))
@@ -249,8 +292,14 @@ def _llm_score_article(article_title: str, article_description: str) -> Dict[str
     return {"label": "Neutral", "score": 0, "rationale": text[:300]}
 
 
-def news_agent(state: FinancialReportState, max_articles: int = 6) -> Dict[str, Any]:
-    """Fetch recent news mentioning the symbol and score each article using LLM or heuristic."""
+def news_agent(state: FinancialReportState, max_articles: int = 6, use_llm: bool = True) -> Dict[str, Any]:
+    """Fetch recent news mentioning the symbol and score each article using LLM or heuristic.
+
+    use_llm semantics:
+    - use_llm is None: prefer LLM when available, otherwise fall back to heuristic
+    - use_llm is True: require LLM (raise if not available)
+    - use_llm is False: always use heuristic
+    """
     symbol = state["symbol"]
     if newsapi is None:
         return {"news_sentiment": []}
@@ -266,7 +315,7 @@ def news_agent(state: FinancialReportState, max_articles: int = 6) -> Dict[str, 
     for a in articles:
         title = a.get("title")
         desc = a.get("description") or a.get("content")
-        scored_result = _llm_score_article(title or "", desc or "")
+        scored_result = _llm_score_article(title or "", desc or "", use_llm=use_llm)
         scored.append({
             "title": title,
             "url": a.get("url"),
@@ -302,28 +351,32 @@ def news_agent(state: FinancialReportState, max_articles: int = 6) -> Dict[str, 
 # Narrative Agent
 # -----------------------------
 
-def narrative_agent(state: FinancialReportState) -> Dict[str, Any]:
+def narrative_agent(state: FinancialReportState, use_llm: bool = True) -> Dict[str, Any]:
     """Use the LLM to compose a short analyst-style commentary.
 
-    If no LLM is available, fall back to a templated summary.
+    If use_llm is True, this requires an LLM and will raise if unavailable or on invocation errors.
+    If use_llm is False, returns a templated summary (no LLM calls).
     """
     today = datetime.date.today().strftime("%B %d, %Y")
     metrics = state.get("financial_metrics") or {}
     agg = state.get("aggregated_sentiment") or {}
 
-    if llm is None:
-        # Templated, conservative summary
-        lines = [f"{state['symbol']} Investment Commentary - {today}"]
-        lines.append("\nSUMMARY:\n")
-        lines.append(f"Valuation: {state.get('valuation', 'N/A')}")
-        lines.append("Key metrics:\n")
-        for k, v in metrics.items():
-            lines.append(f"- {k}: {v}")
-        lines.append("")
-        counts = agg.get('counts', {})
-        lines.append(f"News snapshot: {counts.get('Positive',0)} positive, {counts.get('Neutral',0)} neutral, {counts.get('Negative',0)} negative articles.")
-        lines.append("\nRecommendation: Monitor upcoming earnings and macro indicators.\n")
-        return {"narrative": "\n".join(lines)}
+    # If LLM usage is disabled, return templated summary immediately
+    # if not use_llm:
+    #     # Templated, conservative summary
+    #     lines = [f"{state['symbol']} Investment Commentary - {today}"]
+    #     lines.append("\nSUMMARY:\n")
+    #     lines.append(f"Valuation: {state.get('valuation', 'N/A')}")
+    #     lines.append("Key metrics:\n")
+    #     for k, v in metrics.items():
+    #         lines.append(f"- {k}: {v}")
+    #     lines.append("")
+    #     counts = agg.get('counts', {})
+    #     lines.append(f"News snapshot: {counts.get('Positive',0)} positive, {counts.get('Neutral',0)} neutral, {counts.get('Negative',0)} negative articles.")
+    #     lines.append("\nRecommendation: Monitor upcoming earnings and macro indicators.\n")
+    #     return {"narrative": "\n".join(lines)}
+    # if use_llm and llm is None:
+    #     raise RuntimeError("LLM narrative generation requested (use_llm=True) but no LLM client is available. Set GOOGLE_API_KEY and install the required SDK.")
 
     # Build a careful prompt that provides the model with structure
     prompt = textwrap.dedent(f"""
@@ -346,6 +399,7 @@ def narrative_agent(state: FinancialReportState) -> Dict[str, Any]:
     Return plain markdown text; do not include any JSON. Keep the tone formal and concise.
     """)
 
+    # LLM is required here (we raised earlier if missing). Invoke and propagate any errors
     response = llm.invoke(prompt)
     narrative_text = getattr(response, "content", str(response))
     return {"narrative": narrative_text}
@@ -369,27 +423,40 @@ def plot_stock_price_with_indicators(history, symbol: str):
     history['MA50'] = history['Close'].rolling(window=50).mean()
     history['MA200'] = history['Close'].rolling(window=200).mean()
 
-    fig, ax = plt.subplots(2, 1, figsize=(10, 6), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+    import matplotlib.dates as mdates
 
-    ax[0].plot(history.index, history['Close'])
-    ax[0].plot(history.index, history['MA20'])
-    ax[0].plot(history.index, history['MA50'])
-    # MA200 may be NaN for short series
-    ax[0].plot(history.index, history['MA200'])
+    fig, ax = plt.subplots(2, 1, figsize=(12, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+
+    # Price and moving averages with colors and styles
+    ax[0].plot(history.index, history['Close'], label='Close')
+    ax[0].plot(history.index, history['MA20'], label='MA20', )
+    ax[0].plot(history.index, history['MA50'], label='MA50')
+    ax[0].plot(history.index, history['MA200'], label='MA200')
     ax[0].set_title(f"{symbol} - Close Price with Moving Averages (1y)")
     ax[0].set_ylabel("Price")
-    ax[0].grid(True)
+    ax[0].legend()
+    ax[0].grid(True, which='both', linestyle='--', linewidth=0.5)
 
-    # Volume on the lower axis
-    ax[1].bar(history.index, history['Volume'])
+
+    # Volume on the lower axis with color and transparency
+    ax[1].bar(history.index, history['Volume'],  alpha=0.5)
     ax[1].set_ylabel("Volume")
     ax[1].set_xlabel("Date")
-    ax[1].grid(True)
+    ax[1].grid(True, which='both', linestyle='--', linewidth=0.5)
+
+    # Format volume axis with commas
+    import matplotlib.ticker as mticker
+    #ax[1].yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
+    ax[1].yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x/1_000_000:.0f}M"))
+
+    # Improve date formatting
+    ax[1].xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    fig.autofmt_xdate()
 
     fig.tight_layout()
 
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight')
+    plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
     buf.seek(0)
     image_base64 = base64.b64encode(buf.read()).decode('utf-8')
     plt.close(fig)
@@ -425,15 +492,12 @@ def report_agent(state: FinancialReportState) -> Dict[str, Any]:
         md.append(f"- [{a.get('title')}]({a.get('url')}) — {a.get('label')} ({a.get('score')}) — {a.get('rationale')}")
 
     # Narrative
-    md.append("\n## 🧠 Analyst Commentary")
+    md.append("\n## 🤖 Analyst Commentary")
     md.append(state.get('narrative') or "(No narrative generated)")
 
     # Risks & Next steps placeholders
-    md.append("\n## ⚠️ Risks")
-    md.append("- Macroeconomic weakness that impacts revenue growth\n- Company-specific execution issues\n- Regulatory or legal risks")
-
-    md.append("\n## ▶️ Next Steps")
-    md.append("- Monitor upcoming earnings and management commentary\n- Watch sector ETF and macro indicators (rates, unemployment)\n- Re-run sentiment after major news events")
+    md.append("\n## ⚠️ Disclaimer")
+    md.append("The generated report and analysis do not constitute financial advice. Please consult a qualified financial advisor before making investment decisions.")
 
     report_md = "\n\n".join(md)
     return {"markdown_report": report_md}
@@ -443,7 +507,7 @@ def report_agent(state: FinancialReportState) -> Dict[str, Any]:
 # Orchestration (sequential runner)
 # -----------------------------
 
-def run_financial_report(symbol: str, use_graph: bool = False) -> FinancialReportState:
+def run_financial_report(symbol: str, use_graph: bool = False, use_llm: bool = True, max_articles: int = 6) -> FinancialReportState:
     state: FinancialReportState = {
         "symbol": symbol,
         "info": None,
@@ -458,9 +522,11 @@ def run_financial_report(symbol: str, use_graph: bool = False) -> FinancialRepor
 
     # Agents executed sequentially (could be replaced by a StateGraph execution)
     state.update(valuation_agent(state))
-    state.update(news_agent(state))
-    state.update(narrative_agent(state))
+    state.update(news_agent(state, max_articles=max_articles, use_llm=use_llm))
+    state.update(narrative_agent(state, use_llm=use_llm))
     state.update(report_agent(state))
+
+
 
     # Optionally build/visualize graph if StateGraph is available
     if StateGraph is not None and use_graph:

@@ -28,7 +28,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. (Optional) Set up API keys
+### 4. Set up API keys
 - **Google Generative AI:** Set `GOOGLE_API_KEY` in your environment for LLM features.
 - **NewsAPI:** Set `NEWSAPI_KEY` in your environment for news sentiment analysis.
 
