@@ -1,13 +1,7 @@
-# Refactored Financial Report Agent
-# Improvements implemented:
-# - Robust data fetching (yfinance fast_info + history)
-# - Expanded valuation logic (P/E, PEG if available, Debt/Equity, Revenue Growth)
-# - LLM-based news sentiment scoring (per-article, then aggregated)
-# - Moving averages and volume on the price chart
-# - Structured narrative generation via LLM (explicit system + user prompts)
-# - Safer API key handling and error handling
-# - Modular, testable agents and an orchestration function
-# - Produces a Markdown report ready for Medium (or export)
+"""
+Financial Report Agent: Generates investment reports with financial metrics, news sentiment, LLM-based commentary, and Markdown output.
+"""
+
 
 from typing import TypedDict, List, Optional, Dict, Any
 from dataclasses import dataclass
@@ -36,23 +30,14 @@ load_dotenv(dotenv_path=str(root / ".env"), override=False)
 
 
 def get_model_name() -> str:
-    """Return the configured Google model name from environment (or default).
-
-    Use this helper when you want the value to be read at call time (tests,
-    dynamic reconfiguration). For backwards compatibility we still expose
-    a module-level alias `MODEL_NAME` (evaluated once at import).
-    """
+    """Return the configured Google model name from environment (or default)."""
     return os.environ.get("GOOGLE_MODEL", "gemini-2.5-flash")
 
-
-# Backwards-compatible alias (evaluated once). Prefer `get_model_name()` for
-# runtime flexibility (e.g., tests that patch env vars after import).
-MODEL_NAME = get_model_name()
 
 # Logger for warnings/errors (ensure available before we try to instantiate LLM)
 logger = logging.getLogger(__name__)
 if not logger.handlers:
-    logging.basicConfig()
+    logging.basicConfig(level=logging.INFO)
 
 # Optional imports for LLM and StateGraph
 from langgraph.graph import StateGraph
@@ -65,44 +50,36 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 # -----------------------------
 
 # GOOGLE_API_KEY for Gemini (LLM). If not set, prompt securely.
-if "GOOGLE_API_KEY" not in os.environ:
-    try:
-        os.environ["GOOGLE_API_KEY"] = getpass.getpass("Enter your Google AI API key (or set GOOGLE_API_KEY env): ")
-    except Exception:
-        # In non-interactive environments, continue without LLM
-        pass
-
-# NEWSAPI key. Prefer environment var for security; otherwise prompt.
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY")
-if not NEWSAPI_KEY:
-    try:
-        NEWSAPI_KEY = getpass.getpass("Enter your NewsAPI key (or set NEWSAPI_KEY env): ")
-    except Exception:
-        NEWSAPI_KEY = None
 
-newsapi = NewsApiClient(api_key=NEWSAPI_KEY) if NEWSAPI_KEY else None
+try:
+    newsapi = NewsApiClient(api_key=NEWSAPI_KEY) if NEWSAPI_KEY else None
+except Exception as e:
+    logger.error("Failed to instantiate NewsApiClient: %s", repr(e))
+    newsapi = None
 
 # Instantiate LLM client if available
 llm = None
 if ChatGoogleGenerativeAI is not None and os.environ.get("GOOGLE_API_KEY"):
     try:
-        # Resolve model name at instantiation time (uses get_model_name()).
         model_name = get_model_name()
         llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.0, max_retries=2)
         logger.info("Instantiated LLM client with model=%s", model_name)
     except Exception as e:
-        # If instantiation fails (e.g., unsupported model name), disable LLM usage but log the error
-        # Use the same resolution for the log message so it matches what we attempted.
-        try:
-            attempted = model_name
-        except NameError:
-            attempted = get_model_name()
-        logger.warning("Failed to instantiate LLM client for model=%s: %s", attempted, repr(e))
+        attempted = model_name if 'model_name' in locals() else get_model_name()
+        logger.error("Failed to instantiate LLM client for model=%s: %s", attempted, repr(e))
         llm = None
+else:
+    logger.error("langchain_google_genai is not installed or GOOGLE_API_KEY is missing. LLM features will be disabled.")
+    llm = None
 
 if llm is None:
     print("WARNING: LLM features are disabled. To enable, set GOOGLE_API_KEY and install langchain_google_genai.")
     print("Some features (news sentiment, analyst commentary) will use fallback logic.")
+
+if newsapi is None:
+    logger.error("NewsAPI client is not available. News sentiment features will be disabled. Please install newsapi-python and set NEWSAPI_KEY.")
 
 # -----------------------------
 # Types
@@ -145,72 +122,77 @@ def safe_get_ticker(symbol: str):
 # -----------------------------
 
 def valuation_agent(state: FinancialReportState) -> Dict[str, Any]:
-    """Compute structured financial metrics and a rule-based recommendation.
+    """
+    Compute key financial metrics and generate a rule-based investment recommendation for a given stock symbol.
 
-    Logic used (simple rule-based heuristics):
-    - P/E (trailing) if available
-    - Revenue growth (from info if available) or None
-    - Debt/Equity from info if available
-    - Compute PEG if we have earnings growth
-    - Recommendation uses multiple signals (PE, PEG, revenue growth, debt/equity)
+    Extracts metrics such as trailing P/E, PEG ratio, revenue growth, debt/equity, and market cap from Yahoo Finance data.
+    Applies simple rules to recommend 'Buy', 'Hold', or 'Sell' based on these metrics.
+
+    Args:
+        state (FinancialReportState): The current report state, must include 'symbol'.
+
+    Returns:
+        Dict[str, Any]: Dictionary with keys:
+            - info: Raw company info from yfinance
+            - history: Price history DataFrame
+            - financial_metrics: Dict of computed metrics
+            - valuation: String recommendation ('Buy', 'Hold', 'Sell')
     """
     symbol = state["symbol"]
-    ticker, info, fast, hist = safe_get_ticker(symbol)
+    try:
+        ticker, info, fast, hist = safe_get_ticker(symbol)
+    except Exception as e:
+        logger.error(f"Failed to fetch data for {symbol}: {e}")
+        return {
+            "info": {},
+            "history": None,
+            "financial_metrics": {"error": "Failed to fetch data. API rate limit or connection issue."},
+            "valuation": "N/A",
+        }
 
-    # Extract metrics safely
-    trailing_pe = info.get("trailingPE") or fast.get("trailing_pe") or None
+    # Check for missing or empty data (rate limit, delisted, etc.)
+    if not info or (hist is not None and hasattr(hist, "empty") and hist.empty):
+        logger.error(f"No data returned for {symbol}. Possible rate limit or delisted ticker.")
+        return {
+            "info": info,
+            "history": hist,
+            "financial_metrics": {"error": "No data returned. Possible rate limit or delisted ticker."},
+            "valuation": "N/A",
+        }
+
+    trailing_pe = info.get("trailingPE") or fast.get("trailing_pe")
     revenue_growth = info.get("revenueGrowth")
-    if revenue_growth is not None:
-        try:
-            revenue_growth_pct = float(revenue_growth) * 100
-        except Exception:
-            revenue_growth_pct = None
-    else:
-        revenue_growth_pct = None
-
+    revenue_growth_pct = float(revenue_growth) * 100 if revenue_growth else None
     debt_to_equity = info.get("debtToEquity")
     market_cap = info.get("marketCap") or fast.get("market_cap")
-
-    # Attempt PEG using earningsGrowth if provided
     earnings_growth = info.get("earningsQuarterlyGrowth") or info.get("earningsGrowth")
-    peg = None
-    try:
-        if trailing_pe and earnings_growth:
-            if isinstance(earnings_growth, (int, float)) and earnings_growth != 0:
-                peg = trailing_pe / (earnings_growth * 100)  # if earnings_growth is fraction
-            else:
-                # If earnings_growth already in percent
-                peg = trailing_pe / float(earnings_growth)
-    except Exception:
-        peg = None
 
-    # Build a metrics dict
+    peg = None
+    if trailing_pe and earnings_growth:
+        try:
+            if isinstance(earnings_growth, (int, float)) and earnings_growth != 0:
+                peg = trailing_pe / (earnings_growth * 100)
+            else:
+                peg = trailing_pe / float(earnings_growth)
+        except Exception:
+            peg = None
+
     metrics = {
-        "P/E (trailing)": trailing_pe if trailing_pe is not None else "N/A",
+        "P/E (trailing)": trailing_pe or "N/A",
         "PEG": round(peg, 2) if isinstance(peg, (int, float)) and not math.isnan(peg) else "N/A",
         "Revenue Growth (%)": f"{revenue_growth_pct:.2f}%" if revenue_growth_pct is not None else "N/A",
         "Debt/Equity": round(debt_to_equity, 2) if isinstance(debt_to_equity, (int, float)) else "N/A",
         "Market Cap (USD)": f"${market_cap:,}" if market_cap else "N/A",
     }
 
-    # Rule-based recommendation (expandable)
     recommendation = "Hold"
-    try:
-        # Conservative buy conditions
-        if trailing_pe and trailing_pe < 15 and (revenue_growth_pct is not None and revenue_growth_pct > 10) and (not isinstance(debt_to_equity, (int, float)) or debt_to_equity < 1.5):
-            recommendation = "Buy"
-        # If PEG shows cheap relative to growth
-        elif isinstance(peg, (int, float)) and peg > 0 and peg < 1.5:
-            recommendation = "Buy"
-        # Clear sell signals
-        elif trailing_pe and trailing_pe > 40 and (revenue_growth_pct is not None and revenue_growth_pct < 0):
-            recommendation = "Sell"
-        else:
-            recommendation = "Hold"
-    except Exception:
-        recommendation = "Hold"
+    if trailing_pe and trailing_pe < 15 and revenue_growth_pct and revenue_growth_pct > 10 and (not isinstance(debt_to_equity, (int, float)) or debt_to_equity < 1.5):
+        recommendation = "Buy"
+    elif isinstance(peg, (int, float)) and peg > 0 and peg < 1.5:
+        recommendation = "Buy"
+    elif trailing_pe and trailing_pe > 40 and revenue_growth_pct and revenue_growth_pct < 0:
+        recommendation = "Sell"
 
-    # Attach derived items to state
     return {
         "info": info,
         "history": hist,
@@ -223,113 +205,108 @@ def valuation_agent(state: FinancialReportState) -> Dict[str, Any]:
 # News Agent (LLM-based sentiment scoring)
 # -----------------------------
 
-def _llm_score_article(article_title: str, article_description: str, use_llm: bool = True) -> Dict[str, Any]:
-    """Use the LLM to score sentiment and extract a short rationale.
-
-    If no LLM is available, fall back to keyword heuristics.
+def _llm_score_article(article_title: str, article_description: str) -> Dict[str, Any]:
     """
-    # def _heuristic(desc_text: str) -> Dict[str, Any]:
-    #     d = (desc_text or "").lower()
-    #     positive_keywords = ["beat", "growth", "strong", "positive", "surge", "upgrade", "outperform"]
-    #     negative_keywords = ["miss", "downgrade", "lawsuit", "loss", "recall", "weak", "slow"]
-    #     score = 0
-    #     for w in positive_keywords:
-    #         if w in d:
-    #             score += 1
-    #     for w in negative_keywords:
-    #         if w in d:
-    #             score -= 1
-    #     label = "Neutral"
-    #     if score > 0:
-    #         label = "Positive"
-    #     elif score < 0:
-    #         label = "Negative"
-    #     return {"label": label, "score": score, "rationale": "Keyword heuristic"}
+    Analyze the sentiment of a financial news article using an LLM.
 
-    # # use_llm semantics (now strict boolean):
-    # # - use_llm == True: require LLM; raise if unavailable
-    # # - use_llm == False: always use heuristic
-    # if not use_llm:
-    #     return _heuristic(article_description)
-    # if llm is None:
-    #     raise RuntimeError("LLM scoring requested (use_llm=True) but no LLM client is available. Set GOOGLE_API_KEY and install the required SDK.")
+    Args:
+        article_title (str): The headline of the news article.
+        article_description (str): The description or summary of the article.
 
-    # If LLM is available, ask for a sentiment label and a 1-2 sentence rationale.
-    prompt = textwrap.dedent(f"""
-    You are a concise financial news grader.
-    Given a news headline and short description, return a JSON object with three fields:
-    - label: one of Positive, Neutral, Negative
-    - score: integer in [-2, -1, 0, 1, 2] where 2 is very positive, -2 very negative
-    - rationale: 1-2 sentence explanation in plain English.
+    Returns:
+        Dict[str, Any]: Dictionary with keys:
+            - label: Sentiment label ('Positive', 'Neutral', 'Negative')
+            - score: Integer sentiment score in [-2, 2]
+            - rationale: Short explanation of the sentiment decision
+    """
+    # Only use LLM for sentiment scoring. If unavailable, return Neutral/0 with rationale.
+    if llm is not None:
+        prompt = textwrap.dedent(f"""
+        You are a concise financial news grader.
+        Given a news headline and short description, return a JSON object with three fields:
+        - label: one of Positive, Neutral, Negative
+        - score: integer in [-2, -1, 0, 1, 2] where 2 is very positive, -2 very negative
+        - rationale: 1-2 sentence explanation in plain English.
 
-    Headline: """ + article_title + """
-    Description: """ + (article_description or "") + """
+        Headline: {article_title}
+        Description: {article_description or ""}
 
-    Return ONLY JSON.
-    """)
+        Return ONLY JSON.
+        """)
+        try:
+            response = llm.invoke(prompt)
+            text = getattr(response, "content", str(response))
+            import json
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                json_text = text[start:end+1]
+                parsed = json.loads(json_text)
+                return {
+                    "label": parsed.get("label", "Neutral"),
+                    "score": parsed.get("score", 0),
+                    "rationale": parsed.get("rationale", "")
+                }
+        except Exception as e:
+            logger.warning(f"LLM sentiment scoring failed: {e}")
+            # fallback below
 
-    # LLM is required (we raised above if missing). If the LLM invocation fails, propagate
-    # the exception so the caller sees quota/auth/network errors rather than silently
-    # falling back to heuristics.
-    response = llm.invoke(prompt)
-    # The response format depends on the LLM client; best-effort parsing
-    text = getattr(response, "content", str(response))
-
-    # Try to extract JSON-ish content from the response
-    import json
-    try:
-        # naive attempt: find first { ... } block
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            json_text = text[start:end+1]
-            parsed = json.loads(json_text)
-            return {"label": parsed.get("label", "Neutral"), "score": parsed.get("score", 0), "rationale": parsed.get("rationale", "")}
-    except Exception:
-        pass
-
-    # fallback if parsing fails
-    return {"label": "Neutral", "score": 0, "rationale": text[:300]}
+    # If LLM is unavailable or fails, return Neutral sentiment
+    return {
+        "label": "Neutral",
+        "score": 0,
+        "rationale": "No LLM available for sentiment analysis. Defaulting to Neutral."
+    }
 
 
-def news_agent(state: FinancialReportState, max_articles: int = 6, use_llm: bool = True) -> Dict[str, Any]:
-    """Fetch recent news mentioning the symbol and score each article using LLM or heuristic.
+def news_agent(state: FinancialReportState, max_articles: int = 6) -> Dict[str, Any]:
+    """
+    Fetch and analyze recent news articles for a given stock symbol.
 
-    use_llm semantics:
-    - use_llm is None: prefer LLM when available, otherwise fall back to heuristic
-    - use_llm is True: require LLM (raise if not available)
-    - use_llm is False: always use heuristic
+    Each article is scored for sentiment using the LLM (if available).
+    Aggregates sentiment statistics across all articles.
+
+    Args:
+        state (FinancialReportState): The current report state, must include 'symbol'.
+        max_articles (int): Maximum number of news articles to fetch and score.
+
+    Returns:
+        Dict[str, Any]: Dictionary with keys:
+            - news_sentiment: List of per-article sentiment dicts
+            - aggregated_sentiment: Dict with counts, average_score, n_articles
     """
     symbol = state["symbol"]
     if newsapi is None:
-        return {"news_sentiment": []}
+        logger.warning("NewsAPI client unavailable. Returning empty news sentiment.")
+        return {"news_sentiment": [], "aggregated_sentiment": {"counts": {}, "average_score": 0, "n_articles": 0}}
 
     try:
-        # Query the entire symbol string; for tickers like AAPL this often works
         raw = newsapi.get_everything(q=symbol, language="en", sort_by="relevancy", page_size=max_articles)
         articles = raw.get("articles", [])
-    except Exception:
+    except Exception as e:
+        logger.warning(f"NewsAPI fetch failed: {e}")
         articles = []
 
     scored = []
     for a in articles:
-        title = a.get("title")
-        desc = a.get("description") or a.get("content")
-        scored_result = _llm_score_article(title or "", desc or "", use_llm=use_llm)
+        title = a.get("title", "")
+        desc = a.get("description") or a.get("content") or ""
+        result = _llm_score_article(title, desc)
         scored.append({
             "title": title,
             "url": a.get("url"),
             "publishedAt": a.get("publishedAt"),
-            "label": scored_result["label"],
-            "score": scored_result["score"],
-            "rationale": scored_result["rationale"],
+            "label": result["label"],
+            "score": result["score"],
+            "rationale": result["rationale"],
         })
 
-    # Aggregate
+    # Aggregate sentiment
     counts = {"Positive": 0, "Neutral": 0, "Negative": 0}
     score_sum = 0
     for s in scored:
-        counts[s["label"]] = counts.get(s["label"], 0) + 1
+        if s["label"] in counts:
+            counts[s["label"]] += 1
         try:
             score_sum += int(s["score"])
         except Exception:
@@ -351,58 +328,81 @@ def news_agent(state: FinancialReportState, max_articles: int = 6, use_llm: bool
 # Narrative Agent
 # -----------------------------
 
-def narrative_agent(state: FinancialReportState, use_llm: bool = True) -> Dict[str, Any]:
-    """Use the LLM to compose a short analyst-style commentary.
+def narrative_agent(state: FinancialReportState, tone: str = "formal", length: str = "medium") -> Dict[str, Any]:
+    """
+    Generate a short analyst-style investment commentary using an LLM.
 
-    If use_llm is True, this requires an LLM and will raise if unavailable or on invocation errors.
-    If use_llm is False, returns a templated summary (no LLM calls).
+    Composes a multi-paragraph markdown report summarizing financial metrics, news sentiment, risks, and next steps.
+    If LLM is unavailable, returns a templated summary instead.
+
+    Args:
+        state (FinancialReportState): The current report state, must include financial metrics and news sentiment.
+
+    Returns:
+        Dict[str, Any]: Dictionary with key:
+            - narrative: Markdown-formatted analyst commentary string
     """
     today = datetime.date.today().strftime("%B %d, %Y")
     metrics = state.get("financial_metrics") or {}
     agg = state.get("aggregated_sentiment") or {}
 
-    # If LLM usage is disabled, return templated summary immediately
-    # if not use_llm:
-    #     # Templated, conservative summary
-    #     lines = [f"{state['symbol']} Investment Commentary - {today}"]
-    #     lines.append("\nSUMMARY:\n")
-    #     lines.append(f"Valuation: {state.get('valuation', 'N/A')}")
-    #     lines.append("Key metrics:\n")
-    #     for k, v in metrics.items():
-    #         lines.append(f"- {k}: {v}")
-    #     lines.append("")
-    #     counts = agg.get('counts', {})
-    #     lines.append(f"News snapshot: {counts.get('Positive',0)} positive, {counts.get('Neutral',0)} neutral, {counts.get('Negative',0)} negative articles.")
-    #     lines.append("\nRecommendation: Monitor upcoming earnings and macro indicators.\n")
-    #     return {"narrative": "\n".join(lines)}
-    # if use_llm and llm is None:
-    #     raise RuntimeError("LLM narrative generation requested (use_llm=True) but no LLM client is available. Set GOOGLE_API_KEY and install the required SDK.")
-
-    # Build a careful prompt that provides the model with structure
+    
+    # Enhanced prompt for clarity, actionable insights, and audience targeting
     prompt = textwrap.dedent(f"""
-    You are an experienced equity analyst.
+    You are an experienced equity analyst writing for professional investors and portfolio managers.
     Today's date: {today}
 
     Company: {state['symbol']}
 
-    Provide a short (3-5 paragraph) investment commentary suitable for a research note. The commentary should include:
-    1) A concise headline (one line) summarizing the recommendation.
-    2) A short overview of recent financial metrics (explicitly mention P/E, Revenue Growth, Debt/Equity, PEG if available).
-    3) A brief synthesis of recent news (synthesize the aggregated sentiment and 1-2 notable articles with rationale).
-    4) A Risks section listing 3 key risks.
-    5) A "Next Steps" section suggesting what to monitor next (e.g., earnings, guidance, macro indicators).
+    Your task is to draft a concise (3-5 paragraph) investment commentary suitable for a research note. Structure your response as follows:
+    1. **Headline:** One sentence summarizing the investment recommendation (Buy/Hold/Sell) and rationale.
+    2. **Financial Overview:** Summarize recent financial metrics, explicitly referencing P/E, Revenue Growth, Debt/Equity, PEG (if available), and any notable trends or anomalies.
+    3. **News Synthesis:** Integrate the aggregated news sentiment and highlight 1-2 notable articles, explaining their relevance and impact on the investment thesis.
+    4. **Risks:** List and briefly explain 3 key risks that could affect the investment outlook.
+    5. **Next Steps:** Suggest what investors should monitor next (e.g., upcoming earnings, management guidance, macroeconomic indicators).
 
     Use the following structured data in your analysis:
     Financial Metrics: {metrics}
     Aggregated News Sentiment: {agg}
 
-    Return plain markdown text; do not include any JSON. Keep the tone formal and concise.
+    Output requirements:
+    - Write in {tone} style.
+    - Target length: {length}.
+    - Format as plain markdown text (no JSON, no code blocks).
+    - Make the analysis actionable and relevant for professional investors.
     """)
 
-    # LLM is required here (we raised earlier if missing). Invoke and propagate any errors
-    response = llm.invoke(prompt)
-    narrative_text = getattr(response, "content", str(response))
-    return {"narrative": narrative_text}
+
+
+    # # Build a careful prompt that provides the model with structure and style control
+    # prompt = textwrap.dedent(f"""
+    # You are an experienced equity analyst.
+    # Today's date: {today}
+
+    # Company: {state['symbol']}
+
+    # Provide a short (3-5 paragraph) investment commentary suitable for a research note. The commentary should include:
+    # 1) A concise headline (one line) summarizing the recommendation.
+    # 2) A short overview of recent financial metrics (explicitly mention P/E, Revenue Growth, Debt/Equity, PEG if available).
+    # 3) A brief synthesis of recent news (synthesize the aggregated sentiment and 1-2 notable articles with rationale).
+    # 4) A Risks section listing 3 key risks.
+    # 5) A "Next Steps" section suggesting what to monitor next (e.g., earnings, guidance, macro indicators).
+
+    # Use the following structured data in your analysis:
+    # Financial Metrics: {metrics}
+    # Aggregated News Sentiment: {agg}
+
+    # Output style: {tone}
+    # Desired length: {length}
+
+    # Return plain markdown text; do not include any JSON. Keep the tone as specified.
+    # """)
+
+
+    # # LLM is required here (we raised earlier if missing). Invoke and propagate any errors
+    # response = llm.invoke(prompt)
+    # narrative_text = getattr(response, "content", str(response))
+    # return {"narrative": narrative_text}
 
 
 # -----------------------------
@@ -465,38 +465,79 @@ def plot_stock_price_with_indicators(history, symbol: str):
 
 
 def report_agent(state: FinancialReportState) -> Dict[str, Any]:
+    """
+    Assemble a Markdown-formatted investment report from the current state.
+
+    Includes price chart, key metrics, analyst recommendation, news sentiment, narrative, risks, next steps, and disclaimer.
+
+    Args:
+        state (FinancialReportState): The current report state containing all relevant data.
+
+    Returns:
+        Dict[str, Any]: Dictionary with key 'markdown_report' containing the full Markdown report.
+    """
+    import logging
     today = datetime.date.today().strftime("%B %d, %Y")
     md = [f"# {state['symbol']} Investment Commentary - {today}\n"]
 
     # Price chart
     hist = state.get('history')
+    if hist is None:
+        logging.warning(f"No historical price data for {state['symbol']}")
     md.append("## 📈 Price Chart")
     md.append(plot_stock_price_with_indicators(hist, state['symbol']))
 
     # Key metrics
-    md.append("\n## 📊 Key Financial Metrics")
-    for k, v in (state.get('financial_metrics') or {}).items():
+    metrics = state.get('financial_metrics')
+    if not metrics:
+        logging.warning(f"No financial metrics for {state['symbol']}")
+    md.append("## 📊 Key Financial Metrics")
+    for k, v in (metrics or {}).items():
         md.append(f"- **{k}**: {v}")
 
-    # Valuation badge
+    # Valuation badge with emoji
     val = state.get('valuation', 'N/A')
-    md.append(f"\n**Analyst Recommendation:** **{val}**")
+    badge = {
+        "Buy": "🟢 Buy",
+        "Hold": "🟡 Hold",
+        "Sell": "🔴 Sell"
+    }.get(val, f"⚪ {val}")
+    md.append(f"## 🏅 Analyst Recommendation\n**{badge}**")
 
     # News section
-    md.append("\n## 📰 News Sentiment Summary")
+    news_sentiment = state.get('news_sentiment')
+    if not news_sentiment:
+        logging.warning(f"No news sentiment for {state['symbol']}")
+    md.append("## 📰 News Sentiment Summary")
     agg = state.get('aggregated_sentiment') or {}
     counts = agg.get('counts', {})
     md.append(f"- Positive: {counts.get('Positive', 0)}  |  Neutral: {counts.get('Neutral', 0)}  |  Negative: {counts.get('Negative', 0)}")
-
-    for a in (state.get('news_sentiment') or []):
+    for a in (news_sentiment or []):
         md.append(f"- [{a.get('title')}]({a.get('url')}) — {a.get('label')} ({a.get('score')}) — {a.get('rationale')}")
 
     # Narrative
-    md.append("\n## 🤖 Analyst Commentary")
-    md.append(state.get('narrative') or "(No narrative generated)")
+    narrative = state.get('narrative')
+    if not narrative:
+        logging.warning(f"No narrative generated for {state['symbol']}")
+    md.append("## 🤖 Analyst Commentary")
+    md.append(narrative or "(No narrative generated)")
 
-    # Risks & Next steps placeholders
-    md.append("\n## ⚠️ Disclaimer")
+    # Risks section (if present)
+    risks = state.get('risks')
+    if risks:
+        md.append("## ⚠️ Key Risks")
+        for r in risks:
+            md.append(f"- {r}")
+
+    # Next Steps section (if present)
+    next_steps = state.get('next_steps')
+    if next_steps:
+        md.append("## ⏭️ Next Steps")
+        for step in next_steps:
+            md.append(f"- {step}")
+
+    # Disclaimer
+    md.append("## ⚠️ Disclaimer ⚠️")
     md.append("The generated report and analysis do not constitute financial advice. Please consult a qualified financial advisor before making investment decisions.")
 
     report_md = "\n\n".join(md)
@@ -507,7 +548,20 @@ def report_agent(state: FinancialReportState) -> Dict[str, Any]:
 # Orchestration (sequential runner)
 # -----------------------------
 
-def run_financial_report(symbol: str, use_graph: bool = False, use_llm: bool = True, max_articles: int = 6) -> FinancialReportState:
+def run_financial_report(symbol: str, use_graph: bool = False, max_articles: int = 6) -> FinancialReportState:
+    """
+    Orchestrate the financial report generation by running all agents in sequence or via StateGraph.
+
+    Handles error logging for each agent. Optionally uses StateGraph for advanced orchestration.
+
+    Args:
+        symbol (str): Ticker symbol for the report.
+        use_graph (bool): Whether to use StateGraph orchestration.
+        max_articles (int): Maximum number of news articles to fetch.
+
+    Returns:
+        FinancialReportState: Final state containing all report data and Markdown output.
+    """
     state: FinancialReportState = {
         "symbol": symbol,
         "info": None,
@@ -520,13 +574,19 @@ def run_financial_report(symbol: str, use_graph: bool = False, use_llm: bool = T
         "markdown_report": None,
     }
 
-    # Agents executed sequentially (could be replaced by a StateGraph execution)
-    state.update(valuation_agent(state))
-    state.update(news_agent(state, max_articles=max_articles, use_llm=use_llm))
-    state.update(narrative_agent(state, use_llm=use_llm))
-    state.update(report_agent(state))
-
-
+    import logging
+    # Agents executed sequentially with error handling
+    agents = [
+        (valuation_agent, {}),
+        (news_agent, {"max_articles": max_articles}),
+        (narrative_agent, {"tone": "formal", "length": "medium"}),
+        (report_agent, {}),
+    ]
+    for agent, kwargs in agents:
+        try:
+            state.update(agent(state, **kwargs))
+        except Exception as e:
+            logging.error(f"{agent.__name__} failed for {symbol}: {e}")
 
     # Optionally build/visualize graph if StateGraph is available
     if StateGraph is not None and use_graph:
@@ -542,15 +602,19 @@ def run_financial_report(symbol: str, use_graph: bool = False, use_llm: bool = T
             g.add_edge("NarrativeAgent", "ReportAgent")
             g.set_finish_point("ReportAgent")
             compiled = g.compile()
-            # compiled.run(state)  # If StateGraph provides a run API, this is illustrative
-        except Exception:
-            pass
+            # Actually run the graph and merge its output into state
+            graph_result = compiled.run(state)
+            if isinstance(graph_result, dict):
+                state.update(graph_result)
+        except Exception as e:
+            import logging
+            logging.error(f"StateGraph execution failed for {symbol}: {e}")
 
     return state
 
 
 # -----------------------------
-# Convenience runner (for notebooks)
+# CLI entry point for running the Financial Report Agent from the command line
 # -----------------------------
 if __name__ == "__main__":
     import argparse
