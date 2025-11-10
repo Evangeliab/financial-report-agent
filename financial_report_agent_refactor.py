@@ -105,9 +105,10 @@ if llm is None:
     print("Some features (news sentiment, analyst commentary) will use fallback logic.")
 
 # -----------------------------
-# Types
+# State Definition
 # -----------------------------
 class FinancialReportState(TypedDict):
+    """Shared state object passed between agents in the financial report pipeline."""
     symbol: str
     info: Optional[Dict[str, Any]]
     history: Optional[Any]
@@ -117,6 +118,15 @@ class FinancialReportState(TypedDict):
     aggregated_sentiment: Optional[Dict[str, Any]]
     narrative: Optional[str]
     markdown_report: Optional[str]
+
+
+def validate_state(state: FinancialReportState) -> None:
+    """Ensure that required state fields are populated before generating the final report."""
+    required_fields = ["symbol", "financial_metrics", "valuation", "news_sentiment", "narrative"]
+    missing = [f for f in required_fields if not state.get(f)]
+    if missing:
+        raise ValueError(f"Missing fields in FinancialReportState: {missing}")
+
 
 
 # -----------------------------
